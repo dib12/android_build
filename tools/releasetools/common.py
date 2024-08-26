@@ -480,13 +480,16 @@ class BuildInfo(object):
     return self.get("virtual_ab_compression_method", "")
 
   @property
+  def vabc_cow_version(self):
+    return self.get("virtual_ab_cow_version", "")
+
+  @property
   def vendor_api_level(self):
     vendor_prop = self.info_dict.get("vendor.build.prop")
     if not vendor_prop:
       return -1
 
     props = [
-        "ro.board.api_level",
         "ro.board.first_api_level",
         "ro.product.first_api_level",
     ]
@@ -1573,50 +1576,6 @@ def GetAvbChainedPartitionArg(partition, info_dict, key=None):
       pubkey_path=pubkey_path)
 
 
-def _HasGkiCertificationArgs():
-  return ("gki_signing_key_path" in OPTIONS.info_dict and
-          "gki_signing_algorithm" in OPTIONS.info_dict)
-
-
-def _GenerateGkiCertificate(image, image_name):
-  key_path = OPTIONS.info_dict.get("gki_signing_key_path")
-  algorithm = OPTIONS.info_dict.get("gki_signing_algorithm")
-
-  key_path = ResolveAVBSigningPathArgs(key_path)
-
-  # Checks key_path exists, before processing --gki_signing_* args.
-  if not os.path.exists(key_path):
-    raise ExternalError(
-        'gki_signing_key_path: "{}" not found'.format(key_path))
-
-  output_certificate = tempfile.NamedTemporaryFile()
-  cmd = [
-      "generate_gki_certificate",
-      "--name", image_name,
-      "--algorithm", algorithm,
-      "--key", key_path,
-      "--output", output_certificate.name,
-      image,
-  ]
-
-  signature_args = OPTIONS.info_dict.get("gki_signing_signature_args", "")
-  signature_args = signature_args.strip()
-  if signature_args:
-    cmd.extend(["--additional_avb_args", signature_args])
-
-  args = OPTIONS.info_dict.get("avb_boot_add_hash_footer_args", "")
-  args = args.strip()
-  if args:
-    cmd.extend(["--additional_avb_args", args])
-
-  RunAndCheckOutput(cmd)
-
-  output_certificate.seek(os.SEEK_SET, 0)
-  data = output_certificate.read()
-  output_certificate.close()
-  return data
-
-
 def BuildVBMeta(image_path, partitions, name, needed_partitions,
                 resolve_rollback_index_location_conflict=False):
   """Creates a VBMeta image.
@@ -1846,29 +1805,6 @@ def _BuildBootableImage(image_name, sourcedir, fs_config_file,
       cmd.extend(["--recovery_acpio", fn])
 
   RunAndCheckOutput(cmd)
-
-  if _HasGkiCertificationArgs():
-    if not os.path.exists(img.name):
-      raise ValueError("Cannot find GKI boot.img")
-    if kernel_path is None or not os.path.exists(kernel_path):
-      raise ValueError("Cannot find GKI kernel.img")
-
-    # Certify GKI images.
-    boot_signature_bytes = b''
-    boot_signature_bytes += _GenerateGkiCertificate(img.name, "boot")
-    boot_signature_bytes += _GenerateGkiCertificate(
-        kernel_path, "generic_kernel")
-
-    BOOT_SIGNATURE_SIZE = 16 * 1024
-    if len(boot_signature_bytes) > BOOT_SIGNATURE_SIZE:
-      raise ValueError(
-          f"GKI boot_signature size must be <= {BOOT_SIGNATURE_SIZE}")
-    boot_signature_bytes += (
-        b'\0' * (BOOT_SIGNATURE_SIZE - len(boot_signature_bytes)))
-    assert len(boot_signature_bytes) == BOOT_SIGNATURE_SIZE
-
-    with open(img.name, 'ab') as f:
-      f.write(boot_signature_bytes)
 
   # Sign the image if vboot is non-empty.
   if info_dict.get("vboot"):
@@ -3873,38 +3809,19 @@ def MakeRecoveryPatch(input_dir, output_sink, recovery_img, boot_img,
 
   full_recovery_image = info_dict.get("full_recovery_image") == "true"
   board_uses_vendorimage = info_dict.get("board_uses_vendorimage") == "true"
+  board_builds_vendorimage =  info_dict.get("board_builds_vendorimage") == "true"
 
-  if board_uses_vendorimage:
-    # In this case, the output sink is rooted at VENDOR
+  if board_builds_vendorimage or not board_uses_vendorimage:
     recovery_img_path = "etc/recovery.img"
-    recovery_resource_dat_path = "VENDOR/etc/recovery-resource.dat"
   else:
-    # In this case the output sink is rooted at SYSTEM
-    recovery_img_path = "vendor/etc/recovery.img"
-    recovery_resource_dat_path = "SYSTEM/vendor/etc/recovery-resource.dat"
+    logger.warning('Recovery patch generation is disable when prebuilt vendor image is used.')
+    return None
 
   if full_recovery_image:
     output_sink(recovery_img_path, recovery_img.data)
 
   else:
-    include_recovery_dtbo = info_dict.get("include_recovery_dtbo") == "true"
-    include_recovery_acpio = info_dict.get("include_recovery_acpio") == "true"
-    path = os.path.join(input_dir, recovery_resource_dat_path)
-    # Use bsdiff to handle mismatching entries (Bug: 72731506)
-    if include_recovery_dtbo or include_recovery_acpio:
-      diff_program = ["bsdiff"]
-      bonus_args = ""
-      assert not os.path.exists(path)
-    else:
-      diff_program = ["imgdiff"]
-      if os.path.exists(path):
-        diff_program.append("-b")
-        diff_program.append(path)
-        bonus_args = "--bonus /vendor/etc/recovery-resource.dat"
-      else:
-        bonus_args = ""
-
-    d = Difference(recovery_img, boot_img, diff_program=diff_program)
+    d = Difference(recovery_img, boot_img)
     _, _, patch = d.ComputePatch()
     output_sink("recovery-from-boot.p", patch)
 
@@ -3942,7 +3859,7 @@ fi
   else:
     sh = """#!/vendor/bin/sh
 if ! applypatch --check %(recovery_type)s:%(recovery_device)s:%(recovery_size)d:%(recovery_sha1)s; then
-  applypatch %(bonus_args)s \\
+  applypatch \\
           --patch /vendor/recovery-from-boot.p \\
           --source %(boot_type)s:%(boot_device)s:%(boot_size)d:%(boot_sha1)s \\
           --target %(recovery_type)s:%(recovery_device)s:%(recovery_size)d:%(recovery_sha1)s && \\
@@ -3958,8 +3875,7 @@ fi
        'boot_type': boot_type,
        'boot_device': boot_device + '$(getprop ro.boot.slot_suffix)',
        'recovery_type': recovery_type,
-       'recovery_device': recovery_device + '$(getprop ro.boot.slot_suffix)',
-       'bonus_args': bonus_args}
+       'recovery_device': recovery_device + '$(getprop ro.boot.slot_suffix)'}
 
   # The install script location moved from /system/etc to /system/bin in the L
   # release. In the R release it is in VENDOR/bin or SYSTEM/vendor/bin.
@@ -4005,6 +3921,9 @@ class DynamicPartitionsDifference(object):
                source_info_dict=None, build_without_vendor=False):
     if progress_dict is None:
       progress_dict = {}
+
+    self._have_super_empty = \
+      info_dict.get("build_super_empty_partition") == "true"
 
     self._build_without_vendor = build_without_vendor
     self._remove_all_before_apply = False
@@ -4103,8 +4022,13 @@ class DynamicPartitionsDifference(object):
     ZipWrite(output_zip, op_list_path, "dynamic_partitions_op_list")
 
     script.Comment('Update dynamic partition metadata')
-    script.AppendExtra('assert(update_dynamic_partitions('
-                       'package_extract_file("dynamic_partitions_op_list")));')
+    if self._have_super_empty:
+      script.AppendExtra('assert(update_dynamic_partitions('
+                        'package_extract_file("dynamic_partitions_op_list"), '
+                        'package_extract_file("unsparse_super_empty.img")));')
+    else:
+      script.AppendExtra('assert(update_dynamic_partitions('
+                        'package_extract_file("dynamic_partitions_op_list")));')
 
     if write_verify_script:
       for p, u in self._partition_updates.items():
